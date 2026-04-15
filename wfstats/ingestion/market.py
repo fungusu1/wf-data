@@ -10,6 +10,7 @@ import requests
 from wfstats.database import DB_PATH, create_db
 
 ORDERS_URL = "https://api.warframe.market/v2/orders/item/{slug}"
+STATISTICS_URL = "https://api.warframe.market/v1/items/{slug}/statistics"
 SOURCE_NAME = "wfm_orders"
 
 log = logging.getLogger(__name__)
@@ -29,9 +30,90 @@ def _fetch_orders(slug: str) -> list[dict[str, Any]]:
     return payload.get("data", [])
 
 
-def _candidate_items(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
-    return conn.execute(
-        """
+def _fetch_statistics(slug: str) -> dict[str, Any]:
+    response = requests.get(STATISTICS_URL.format(slug=slug), timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    return payload.get("payload", {}).get("statistics_closed", {})
+
+
+def _percentile(values: list[int], p: float) -> float:
+    if not values:
+        raise ValueError("Cannot compute percentile of empty values")
+    if len(values) == 1:
+        return float(values[0])
+
+    position = (len(values) - 1) * p
+    lower_index = int(position)
+    upper_index = min(lower_index + 1, len(values) - 1)
+    weight = position - lower_index
+    lower_value = values[lower_index]
+    upper_value = values[upper_index]
+    return lower_value + (upper_value - lower_value) * weight
+
+
+def _filter_sell_outliers(sell_prices: list[int]) -> list[int]:
+    if len(sell_prices) < 8:
+        return sell_prices
+
+    q1 = _percentile(sell_prices, 0.25)
+    q3 = _percentile(sell_prices, 0.75)
+    iqr = q3 - q1
+    if iqr <= 0:
+        return sell_prices
+
+    upper_fence = q3 + (1.5 * iqr)
+    filtered = [price for price in sell_prices if price <= upper_fence]
+    return filtered or sell_prices
+
+
+def _summarize_orders(orders: list[dict[str, Any]]) -> dict[str, float | int | None]:
+    sell_prices = sorted(
+        int(order["platinum"])
+        for order in orders
+        if order.get("type") == "sell" and order.get("platinum") is not None
+    )
+    if not sell_prices:
+        return {
+            "order_count": 0,
+            "min_sell_price": None,
+            "avg_sell_price": None,
+            "current_median_sell_price": None,
+        }
+
+    filtered_prices = _filter_sell_outliers(sell_prices)
+    count = len(filtered_prices)
+    middle = count // 2
+    if count % 2:
+        median = float(filtered_prices[middle])
+    else:
+        median = (filtered_prices[middle - 1] + filtered_prices[middle]) / 2
+
+    return {
+        "order_count": count,
+        "min_sell_price": float(filtered_prices[0]),
+        "avg_sell_price": round(sum(filtered_prices) / count, 2),
+        "current_median_sell_price": float(median),
+    }
+
+
+def _summarize_statistics(statistics: dict[str, Any]) -> dict[str, float | None]:
+    rows = statistics.get("90days") or []
+    if not rows:
+        return {
+            "historical_median_90d": None,
+            "historical_wa_price_90d": None,
+        }
+
+    latest = rows[-1]
+    return {
+        "historical_median_90d": latest.get("median"),
+        "historical_wa_price_90d": latest.get("wa_price"),
+    }
+
+
+def _candidate_items(conn: sqlite3.Connection, limit: int | None) -> list[sqlite3.Row]:
+    query = """
         SELECT
             i.id,
             i.item_name,
@@ -45,19 +127,21 @@ def _candidate_items(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
         WHERE i.is_tradable = 1 AND i.wfm_slug IS NOT NULL
         GROUP BY i.id, i.item_name, i.wfm_slug
         ORDER BY has_unvaulted_source DESC, last_fetched_at IS NOT NULL, last_fetched_at, i.item_name
-        LIMIT ?
-        """,
-        [limit],
-    ).fetchall()
+    """
+    params: list[object] = []
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+    return conn.execute(query, params).fetchall()
 
 
 def sync_market_orders(conn: sqlite3.Connection | None = None, limit: int = 5) -> dict[str, Any]:
     own_connection = conn is None
     db = conn or _open_db()
-    limit = max(1, min(limit, 50))
+    item_limit = None if limit <= 0 else max(1, min(limit, 1000))
 
     try:
-        items = _candidate_items(db, limit)
+        items = _candidate_items(db, item_limit)
         synced = 0
         order_count = 0
         fetched_at = int(time.time())
@@ -66,6 +150,9 @@ def sync_market_orders(conn: sqlite3.Connection | None = None, limit: int = 5) -
             slug = item["wfm_slug"]
             log.info("Fetching market orders for %s", slug)
             orders = _fetch_orders(slug)
+            statistics = _fetch_statistics(slug)
+            order_summary = _summarize_orders(orders)
+            statistics_summary = _summarize_statistics(statistics)
 
             with db:
                 db.execute("DELETE FROM market_orders WHERE item_id = ?", [item["id"]])
@@ -109,6 +196,38 @@ def sync_market_orders(conn: sqlite3.Connection | None = None, limit: int = 5) -
                     VALUES (?, ?, ?, ?, ?)
                     """,
                     [SOURCE_NAME, fetched_at, slug, 1, f"orders={len(orders)} item={item['item_name']}"],
+                )
+                db.execute(
+                    """
+                    INSERT INTO item_price_cache (
+                        item_id,
+                        order_count,
+                        min_sell_price,
+                        avg_sell_price,
+                        current_median_sell_price,
+                        historical_median_90d,
+                        historical_wa_price_90d,
+                        fetched_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(item_id) DO UPDATE SET
+                        order_count = excluded.order_count,
+                        min_sell_price = excluded.min_sell_price,
+                        avg_sell_price = excluded.avg_sell_price,
+                        current_median_sell_price = excluded.current_median_sell_price,
+                        historical_median_90d = excluded.historical_median_90d,
+                        historical_wa_price_90d = excluded.historical_wa_price_90d,
+                        fetched_at = excluded.fetched_at
+                    """,
+                    [
+                        item["id"],
+                        order_summary["order_count"],
+                        order_summary["min_sell_price"],
+                        order_summary["avg_sell_price"],
+                        order_summary["current_median_sell_price"],
+                        statistics_summary["historical_median_90d"],
+                        statistics_summary["historical_wa_price_90d"],
+                        fetched_at,
+                    ],
                 )
             synced += 1
 

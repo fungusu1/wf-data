@@ -119,6 +119,21 @@ CREATE TABLE IF NOT EXISTS market_orders (
 );
 
 -- ─────────────────────────────────────────────
+-- Item price cache
+-- Combines current order-book pricing with historical 90-day market stats.
+-- ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS item_price_cache (
+    item_id                  INTEGER PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
+    order_count              INTEGER,
+    min_sell_price           REAL,
+    avg_sell_price           REAL,
+    current_median_sell_price REAL,
+    historical_median_90d    REAL,
+    historical_wa_price_90d  REAL,
+    fetched_at               INTEGER NOT NULL
+);
+
+-- ─────────────────────────────────────────────
 -- Relic expected value cache
 -- Computed from relic_reward_chances × current market_orders.
 -- Invalidated and recomputed whenever market_orders is refreshed.
@@ -146,6 +161,7 @@ CREATE INDEX IF NOT EXISTS idx_mission_sources_relic     ON relic_mission_source
 CREATE INDEX IF NOT EXISTS idx_transient_sources_relic   ON relic_transient_sources(relic_id);
 CREATE INDEX IF NOT EXISTS idx_market_orders_item        ON market_orders(item_id, fetched_at);
 CREATE INDEX IF NOT EXISTS idx_market_orders_type_price  ON market_orders(item_id, order_type, platinum);
+CREATE INDEX IF NOT EXISTS idx_item_price_cache_fetched  ON item_price_cache(fetched_at);
 CREATE INDEX IF NOT EXISTS idx_relic_ev_value            ON relic_ev(expected_value_plat DESC);
 CREATE INDEX IF NOT EXISTS idx_items_wfm_slug            ON items(wfm_slug);
 
@@ -153,30 +169,20 @@ CREATE INDEX IF NOT EXISTS idx_items_wfm_slug            ON items(wfm_slug);
 -- Views  (convenience — no stored data)
 -- ─────────────────────────────────────────────
 
--- Current sell-side price summary per item, derived live from cached orders.
--- Filter to sell orders only; caller can add user_status = 'ingame' if desired.
-CREATE VIEW IF NOT EXISTS v_item_prices AS
+DROP VIEW IF EXISTS v_item_prices;
+CREATE VIEW v_item_prices AS
 SELECT
     item_id,
-    COUNT(*)                                    AS order_count,
-    MIN(platinum)                               AS min_sell_price,
-    AVG(platinum)                               AS avg_sell_price,
-    -- Median approximation: middle value of sorted sell prices
-    platinum                                    AS median_sell_price
-FROM (
-    SELECT
-        item_id,
-        platinum,
-        ROW_NUMBER() OVER (PARTITION BY item_id ORDER BY platinum)              AS rn,
-        COUNT(*)     OVER (PARTITION BY item_id)                                AS cnt
-    FROM market_orders
-    WHERE order_type = 'sell'
-)
-WHERE rn IN ((cnt + 1) / 2, (cnt + 2) / 2)
-GROUP BY item_id;
+    order_count,
+    min_sell_price,
+    avg_sell_price,
+    current_median_sell_price AS median_sell_price,
+    historical_median_90d,
+    historical_wa_price_90d
+FROM item_price_cache;
 
--- Full relic breakdown: every reward with its Intact chance and current min price.
-CREATE VIEW IF NOT EXISTS v_relic_rewards_priced AS
+DROP VIEW IF EXISTS v_relic_rewards_priced;
+CREATE VIEW v_relic_rewards_priced AS
 SELECT
     r.tier || ' ' || r.relic_name              AS relic,
     r.is_vaulted,

@@ -94,18 +94,27 @@ def _slugify(value: str) -> str:
 
 
 def _parse_relic_identity(relic: dict[str, Any]) -> tuple[str, str]:
-    tier = relic.get("tier")
-    relic_name = relic.get("relicName")
-
-    if tier and relic_name:
-        return str(tier), str(relic_name)
-
     name = str(relic.get("name") or "").replace(" Relic", "").strip()
     parts = name.split()
+    if parts and parts[-1] in REFINEMENT_STATES:
+        parts = parts[:-1]
     if len(parts) >= 2:
         return parts[0], parts[1]
 
+    tier = relic.get("tier")
+    relic_name = relic.get("relicName")
+    if tier and relic_name:
+        return str(tier), str(relic_name)
+
     raise ValueError(f"Unable to determine relic identity from payload: {relic!r}")
+
+
+def _parse_relic_state(relic: dict[str, Any]) -> str | None:
+    name = str(relic.get("name") or "").replace(" Relic", "").strip()
+    parts = name.split()
+    if parts and parts[-1] in REFINEMENT_STATES:
+        return parts[-1]
+    return None
 
 
 def _item_payload_from_reward(reward: dict[str, Any]) -> dict[str, Any]:
@@ -185,12 +194,11 @@ def insert_relic(conn: sqlite3.Connection, relic: dict[str, Any]) -> int:
     return int(row[0])
 
 
-def insert_chance(conn: sqlite3.Connection, relic_reward_id: int, rarity: str) -> None:
-    chances = CHANCE_TABLE.get(rarity)
-    if not chances:
-        raise ValueError(f"Unsupported relic reward rarity: {rarity}")
-
+def insert_chance(conn: sqlite3.Connection, relic_reward_id: int, chances: dict[str, float]) -> None:
     for state in REFINEMENT_STATES:
+        drop_chance = chances.get(state)
+        if drop_chance is None:
+            continue
         conn.execute(
             """
             INSERT INTO relic_reward_chances (relic_reward_id, state, drop_chance)
@@ -198,11 +206,29 @@ def insert_chance(conn: sqlite3.Connection, relic_reward_id: int, rarity: str) -
             ON CONFLICT(relic_reward_id, state) DO UPDATE SET
                 drop_chance = excluded.drop_chance
             """,
-            [relic_reward_id, state, chances[state]],
+            [relic_reward_id, state, drop_chance],
         )
 
 
-def _replace_relic_rewards(conn: sqlite3.Connection, relic_id: int, rewards: list[dict[str, Any]]) -> int:
+def _infer_rarity(chances: dict[str, float]) -> str:
+    best_rarity = "Common"
+    best_score: float | None = None
+    for rarity, pattern in CHANCE_TABLE.items():
+        score = 0.0
+        matched = 0
+        for state in REFINEMENT_STATES:
+            if state in chances:
+                score += abs(chances[state] - pattern[state])
+                matched += 1
+        if matched == 0:
+            continue
+        if best_score is None or score < best_score:
+            best_rarity = rarity
+            best_score = score
+    return best_rarity
+
+
+def _replace_relic_rewards(conn: sqlite3.Connection, relic_id: int, relic_entries: dict[str, dict[str, Any]]) -> int:
     conn.execute(
         """
         DELETE FROM relic_reward_chances
@@ -214,14 +240,24 @@ def _replace_relic_rewards(conn: sqlite3.Connection, relic_id: int, rewards: lis
     )
     conn.execute("DELETE FROM relic_rewards WHERE relic_id = ?", [relic_id])
 
+    grouped_rewards: dict[str, dict[str, Any]] = {}
+    for state, relic in relic_entries.items():
+        rewards = relic.get("rewards") or []
+        for reward in rewards:
+            item = _item_payload_from_reward(reward)
+            bucket = grouped_rewards.setdefault(
+                item["wfcd_id"],
+                {
+                    "item": item,
+                    "chances": {},
+                },
+            )
+            bucket["chances"][state] = round(float(reward["chance"]) / 100, 4)
+
     reward_count = 0
-    seen_item_ids: set[int] = set()
-    for reward in rewards:
-        item_id = insert_item(conn, _item_payload_from_reward(reward))
-        if item_id in seen_item_ids:
-            continue
-        seen_item_ids.add(item_id)
-        rarity = str(reward["rarity"])
+    for reward in grouped_rewards.values():
+        item_id = insert_item(conn, reward["item"])
+        rarity = _infer_rarity(reward["chances"])
         conn.execute(
             """
             INSERT INTO relic_rewards (relic_id, item_id, rarity)
@@ -230,7 +266,7 @@ def _replace_relic_rewards(conn: sqlite3.Connection, relic_id: int, rewards: lis
             [relic_id, item_id, rarity],
         )
         reward_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
-        insert_chance(conn, reward_id, rarity)
+        insert_chance(conn, reward_id, reward["chances"])
         reward_count += 1
 
     return reward_count
@@ -259,19 +295,25 @@ def sync_relics(conn: sqlite3.Connection | None = None, force: bool = False) -> 
                 continue
 
             tier, relic_name = _parse_relic_identity(relic)
+            state = _parse_relic_state(relic)
+            if state is None:
+                continue
             key = (tier, relic_name)
-            if key not in grouped_relics:
-                grouped_relics[key] = relic
+            bucket = grouped_relics.setdefault(key, {"base_relic": relic, "states": {}})
+            if state == "Intact":
+                bucket["base_relic"] = relic
+            bucket["states"][state] = relic
 
         with db:
-            for relic in grouped_relics.values():
-                rewards = relic.get("rewards") or []
-                if not rewards:
+            for grouped in grouped_relics.values():
+                base_relic = grouped["base_relic"]
+                state_entries = grouped["states"]
+                if not state_entries:
                     continue
 
-                relic_id = insert_relic(db, relic)
+                relic_id = insert_relic(db, base_relic)
                 relic_count += 1
-                reward_count += _replace_relic_rewards(db, relic_id, rewards)
+                reward_count += _replace_relic_rewards(db, relic_id, state_entries)
 
                 item_rows = db.execute(
                     "SELECT item_id FROM relic_rewards WHERE relic_id = ?",

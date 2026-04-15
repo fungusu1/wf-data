@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import logging
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from wfstats.database import create_db
 from wfstats.helpers import get_con
@@ -10,27 +14,169 @@ from wfstats.ingestion.calculate import calculate_relic_ev
 from wfstats.ingestion.drops import sync_drop_sources
 from wfstats.ingestion.items import sync_relics
 from wfstats.ingestion.market import sync_market_orders
-from wfstats.scheduler import get_scheduler_status, start_scheduler, stop_scheduler
+from wfstats.scheduler import (
+    get_scheduler_status,
+    should_force_startup_refresh,
+    start_background_market_refresh,
+    start_scheduler,
+    stop_scheduler,
+)
+
+STATIC_DIR = Path(__file__).parent / "static"
+REFINEMENT_STATES = ("Intact", "Exceptional", "Flawless", "Radiant")
+log = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     conn = create_db()
     conn.close()
+    if should_force_startup_refresh():
+        started = start_background_market_refresh(force=True)
+        if started:
+            log.info("Started background market refresh during app startup")
     start_scheduler()
     yield
     stop_scheduler()
 
 
 app = FastAPI(title="wfstats", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+def _scheduler_payload() -> dict[str, object]:
+    return get_scheduler_status().__dict__
+
+
+def _validate_state(state: str) -> str:
+    if state not in REFINEMENT_STATES:
+        raise HTTPException(status_code=422, detail="Invalid relic state")
+    return state
+
+
+def _clamp_limit(limit: int) -> int:
+    return max(1, min(limit, 200))
+
+
+def _normalize_optional_limit(limit: int) -> int | None:
+    if limit <= 0:
+        return None
+    return min(limit, 5000)
+
+
+def _group_ev_by_state(rows) -> dict[str, float | None]:
+    ev_by_state = {state: None for state in REFINEMENT_STATES}
+    for row in rows:
+        ev_by_state[row["state"]] = row["expected_value_plat"]
+    return ev_by_state
+
+
+def _top_relic_cards(limit: int, include_vaulted: bool, sort_state: str) -> list[dict[str, object]]:
+    sort_state = _validate_state(sort_state)
+    limit_value = _normalize_optional_limit(limit)
+
+    conn = get_con()
+    try:
+        query = """
+            SELECT
+                r.id,
+                r.tier,
+                r.relic_name,
+                r.image_name,
+                r.is_vaulted,
+                MAX(CASE WHEN ev.state = 'Intact' THEN ev.expected_value_plat END) AS intact_ev,
+                MAX(CASE WHEN ev.state = 'Exceptional' THEN ev.expected_value_plat END) AS exceptional_ev,
+                MAX(CASE WHEN ev.state = 'Flawless' THEN ev.expected_value_plat END) AS flawless_ev,
+                MAX(CASE WHEN ev.state = 'Radiant' THEN ev.expected_value_plat END) AS radiant_ev
+            FROM relics r
+            LEFT JOIN relic_ev ev ON ev.relic_id = r.id
+            WHERE (? = 1 OR r.is_vaulted = 0)
+            GROUP BY r.id, r.tier, r.relic_name, r.image_name, r.is_vaulted
+            ORDER BY
+                CASE ?
+                    WHEN 'Intact' THEN COALESCE(intact_ev, -1)
+                    WHEN 'Exceptional' THEN COALESCE(exceptional_ev, -1)
+                    WHEN 'Flawless' THEN COALESCE(flawless_ev, -1)
+                    ELSE COALESCE(radiant_ev, -1)
+                END DESC,
+                r.tier,
+                r.relic_name
+        """
+        params: list[object] = [int(include_vaulted), sort_state]
+        if limit_value is not None:
+            query += " LIMIT ?"
+            params.append(limit_value)
+        relic_rows = conn.execute(query, params).fetchall()
+
+        cards = []
+        for row in relic_rows:
+            ev_by_state = {
+                "Intact": row["intact_ev"],
+                "Exceptional": row["exceptional_ev"],
+                "Flawless": row["flawless_ev"],
+                "Radiant": row["radiant_ev"],
+            }
+            cards.append(
+                {
+                    "tier": row["tier"],
+                    "relic_name": row["relic_name"],
+                    "name": f"{row['tier']} {row['relic_name']}",
+                    "image_name": row["image_name"],
+                    "is_vaulted": row["is_vaulted"],
+                    "ev": ev_by_state.get(sort_state),
+                    "ev_by_state": ev_by_state,
+                }
+            )
+        return cards
+    finally:
+        conn.close()
+
+
+def _top_mission_cards(limit: int, include_vaulted: bool, state: str) -> list[dict[str, object]]:
+    state = _validate_state(state)
+    limit_value = _normalize_optional_limit(limit)
+
+    conn = get_con()
+    try:
+        query = """
+            SELECT
+                ms.planet,
+                ms.node,
+                ms.game_mode,
+                ms.rotation,
+                ms.drop_chance,
+                r.tier,
+                r.relic_name,
+                r.image_name,
+                r.is_vaulted,
+                ev.expected_value_plat,
+                ROUND(ev.expected_value_plat * (ms.drop_chance / 100.0), 2) AS expected_plat_per_reward
+            FROM relic_mission_sources ms
+            JOIN relics r ON r.id = ms.relic_id
+            JOIN relic_ev ev ON ev.relic_id = r.id AND ev.state = ?
+            WHERE (? = 1 OR r.is_vaulted = 0)
+            ORDER BY expected_plat_per_reward DESC, ms.drop_chance DESC
+        """
+        params: list[object] = [state, int(include_vaulted)]
+        if limit_value is not None:
+            query += " LIMIT ?"
+            params.append(limit_value)
+        rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
 
 
 @app.get("/")
-def root():
-    scheduler = get_scheduler_status()
+def frontend():
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/api/status")
+def status():
     return {
         "status": "ok",
-        "scheduler": scheduler.__dict__,
+        "scheduler": _scheduler_payload(),
     }
 
 
@@ -54,7 +200,7 @@ def sync_market(limit: int = 5):
 
 @app.get("/scheduler")
 def scheduler_status():
-    return get_scheduler_status().__dict__
+    return _scheduler_payload()
 
 
 @app.post("/sync/drops")
@@ -71,7 +217,7 @@ def list_relics(
     vaulted: bool | None = None,
     limit: int = 50,
 ):
-    limit = max(1, min(limit, 200))
+    limit = _clamp_limit(limit)
     conn = get_con()
     try:
         query = """
@@ -104,87 +250,12 @@ def list_relics(
         conn.close()
 
 
-def _top_relics_response(state: str, limit: int, include_vaulted: bool):
-    if state not in {"Intact", "Exceptional", "Flawless", "Radiant"}:
-        raise HTTPException(status_code=422, detail="Invalid relic state")
-    limit = max(1, min(limit, 200))
-
-    conn = get_con()
-    try:
-        query = """
-            SELECT
-                r.tier,
-                r.relic_name,
-                r.is_vaulted,
-                ev.state,
-                ev.expected_value_plat,
-                i.item_name AS best_item,
-                ev.best_item_chance,
-                ev.best_item_price
-            FROM relic_ev ev
-            JOIN relics r ON r.id = ev.relic_id
-            LEFT JOIN items i ON i.id = ev.best_item_id
-            WHERE ev.state = ?
-        """
-        params: list[object] = [state]
-        if not include_vaulted:
-            query += " AND r.is_vaulted = 0"
-        query += " ORDER BY ev.expected_value_plat DESC LIMIT ?"
-        params.append(limit)
-
-        rows = conn.execute(query, params).fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        conn.close()
-
-
-def _top_missions_response(state: str, limit: int, include_vaulted: bool):
-    if state not in {"Intact", "Exceptional", "Flawless", "Radiant"}:
-        raise HTTPException(status_code=422, detail="Invalid relic state")
-    limit = max(1, min(limit, 200))
-
-    conn = get_con()
-    try:
-        query = """
-            SELECT
-                ms.planet,
-                ms.node,
-                ms.game_mode,
-                ms.rotation,
-                ms.drop_chance,
-                ms.rarity,
-                r.tier,
-                r.relic_name,
-                r.is_vaulted,
-                ev.state,
-                ev.expected_value_plat,
-                ROUND(ev.expected_value_plat * (ms.drop_chance / 100.0), 2) AS expected_plat_per_reward,
-                i.item_name AS best_item,
-                ev.best_item_chance,
-                ev.best_item_price
-            FROM relic_mission_sources ms
-            JOIN relics r ON r.id = ms.relic_id
-            JOIN relic_ev ev ON ev.relic_id = r.id
-            LEFT JOIN items i ON i.id = ev.best_item_id
-            WHERE ev.state = ?
-        """
-        params: list[object] = [state]
-        if not include_vaulted:
-            query += " AND r.is_vaulted = 0"
-        query += " ORDER BY expected_plat_per_reward DESC, ms.drop_chance DESC LIMIT ?"
-        params.append(limit)
-        rows = conn.execute(query, params).fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        conn.close()
-
-
 @app.get("/relics/top")
 def top_relics(
     state: str = "Intact",
     limit: int = 20,
 ):
-    return _top_relics_response(state=state, limit=limit, include_vaulted=False)
+    return _top_relic_cards(limit=limit, include_vaulted=False, sort_state=state)
 
 
 @app.get("/relics/top/vaulted")
@@ -192,7 +263,7 @@ def top_relics_including_vaulted(
     state: str = "Intact",
     limit: int = 20,
 ):
-    return _top_relics_response(state=state, limit=limit, include_vaulted=True)
+    return _top_relic_cards(limit=limit, include_vaulted=True, sort_state=state)
 
 
 @app.get("/missions/top")
@@ -200,7 +271,7 @@ def top_missions(
     state: str = "Intact",
     limit: int = 20,
 ):
-    return _top_missions_response(state=state, limit=limit, include_vaulted=False)
+    return _top_mission_cards(limit=limit, include_vaulted=False, state=state)
 
 
 @app.get("/missions/top/vaulted")
@@ -208,7 +279,7 @@ def top_missions_including_vaulted(
     state: str = "Intact",
     limit: int = 20,
 ):
-    return _top_missions_response(state=state, limit=limit, include_vaulted=True)
+    return _top_mission_cards(limit=limit, include_vaulted=True, state=state)
 
 
 @app.get("/relics/{tier}/{relic_name}")
@@ -234,6 +305,15 @@ def get_relic(tier: str, relic_name: str):
         if relic is None:
             raise HTTPException(status_code=404, detail="Relic not found")
 
+        ev_rows = conn.execute(
+            """
+            SELECT state, expected_value_plat
+            FROM relic_ev
+            WHERE relic_id = ?
+            """,
+            [relic["id"]],
+        ).fetchall()
+
         reward_rows = conn.execute(
             """
             SELECT
@@ -243,10 +323,17 @@ def get_relic(tier: str, relic_name: str):
                 i.is_tradable,
                 rr.rarity,
                 rc.state,
-                rc.drop_chance
+                rc.drop_chance,
+                p.order_count,
+                p.min_sell_price,
+                ROUND(p.avg_sell_price, 2) AS avg_sell_price,
+                p.median_sell_price,
+                p.historical_median_90d,
+                p.historical_wa_price_90d
             FROM relic_rewards rr
             JOIN items i ON i.id = rr.item_id
             JOIN relic_reward_chances rc ON rc.relic_reward_id = rr.id
+            LEFT JOIN v_item_prices p ON p.item_id = i.id
             WHERE rr.relic_id = ?
             ORDER BY
                 CASE rr.rarity
@@ -256,6 +343,35 @@ def get_relic(tier: str, relic_name: str):
                 END,
                 i.item_name,
                 rc.state
+            """,
+            [relic["id"]],
+        ).fetchall()
+
+        mission_rows = conn.execute(
+            """
+            SELECT
+                planet,
+                node,
+                game_mode,
+                rotation,
+                drop_chance,
+                rarity
+            FROM relic_mission_sources
+            WHERE relic_id = ?
+            ORDER BY drop_chance DESC, planet, node, rotation
+            """,
+            [relic["id"]],
+        ).fetchall()
+
+        transient_rows = conn.execute(
+            """
+            SELECT
+                objective_name,
+                drop_chance,
+                rarity
+            FROM relic_transient_sources
+            WHERE relic_id = ?
+            ORDER BY drop_chance DESC, objective_name
             """,
             [relic["id"]],
         ).fetchall()
@@ -272,6 +388,12 @@ def get_relic(tier: str, relic_name: str):
                     "image_name": row["image_name"],
                     "is_tradable": row["is_tradable"],
                     "rarity": row["rarity"],
+                    "order_count": row["order_count"],
+                    "min_sell_price": row["min_sell_price"],
+                    "avg_sell_price": row["avg_sell_price"],
+                    "median_sell_price": row["median_sell_price"],
+                    "historical_median_90d": row["historical_median_90d"],
+                    "historical_wa_price_90d": row["historical_wa_price_90d"],
                     "chances": {},
                 }
                 reward_index[key] = reward
@@ -280,7 +402,11 @@ def get_relic(tier: str, relic_name: str):
 
         return {
             **dict(relic),
+            "name": f"{relic['tier']} {relic['relic_name']}",
+            "ev_by_state": _group_ev_by_state(ev_rows),
             "rewards": rewards,
+            "missions": [dict(row) for row in mission_rows],
+            "transient_sources": [dict(row) for row in transient_rows],
         }
     finally:
         conn.close()

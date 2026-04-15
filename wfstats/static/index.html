@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>wfstats</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <main class="page">
+      <header class="header">
+        <div>
+          <p class="eyebrow">wfstats</p>
+          <h1>Relics and missions worth running</h1>
+        </div>
+        <label class="toggle">
+          <input id="vaulted-toggle" type="checkbox" />
+          <span>Include vaulted</span>
+        </label>
+      </header>
+
+      <section class="grid">
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Relics</h2>
+          </div>
+          <input id="relic-search" class="search" type="search" placeholder="Search relics" />
+          <div id="relic-list" class="card-list"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Missions</h2>
+          </div>
+          <input id="mission-search" class="search" type="search" placeholder="Search missions or relics" />
+          <div id="mission-list" class="card-list"></div>
+        </section>
+      </section>
+    </main>
+
+    <template id="relic-card-template">
+      <article class="card">
+        <button class="card-button" type="button">
+          <div class="card-top">
+            <img class="card-image" alt="" />
+            <div class="card-main">
+              <div class="card-title-row">
+                <h3 class="card-title"></h3>
+                <span class="pill"></span>
+              </div>
+              <p class="card-ev"></p>
+              <dl class="ev-grid"></dl>
+            </div>
+          </div>
+        </button>
+        <div class="card-detail is-hidden">
+          <section>
+            <h4>Drops</h4>
+            <div class="detail-table rewards"></div>
+          </section>
+          <section>
+            <h4>Farm missions</h4>
+            <div class="detail-table missions"></div>
+          </section>
+        </div>
+      </article>
+    </template>
+
+    <template id="mission-card-template">
+      <article class="card mission-card">
+        <div class="card-top">
+          <div class="card-main">
+            <div class="card-title-row">
+              <h3 class="card-title"></h3>
+              <span class="pill"></span>
+            </div>
+            <p class="card-ev"></p>
+            <p class="card-meta"></p>
+          </div>
+        </div>
+      </article>
+    </template>
+
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

@@ -26,7 +26,9 @@ def calculate_relic_ev(conn: sqlite3.Connection | None = None) -> dict[str, int]
                 rc.state,
                 i.id AS item_id,
                 rc.drop_chance,
-                p.avg_sell_price
+                p.avg_sell_price,
+                p.median_sell_price,
+                p.historical_median_90d
             FROM relics r
             JOIN relic_rewards rr ON rr.relic_id = r.id
             JOIN relic_reward_chances rc ON rc.relic_reward_id = rr.id
@@ -47,13 +49,17 @@ def calculate_relic_ev(conn: sqlite3.Connection | None = None) -> dict[str, int]
         )
 
         for row in rows:
-            avg_price = row["avg_sell_price"]
-            if avg_price is None:
+            market_price = row["historical_median_90d"]
+            if market_price is None:
+                market_price = row["median_sell_price"]
+            if market_price is None:
+                market_price = row["avg_sell_price"]
+            if market_price is None:
                 continue
 
             key = (int(row["relic_id"]), str(row["state"]))
             chance = float(row["drop_chance"])
-            weighted_value = chance * float(avg_price)
+            weighted_value = chance * float(market_price)
             bucket = grouped[key]
             bucket["expected_value_plat"] = float(bucket["expected_value_plat"]) + weighted_value
 
@@ -61,7 +67,7 @@ def calculate_relic_ev(conn: sqlite3.Connection | None = None) -> dict[str, int]
                 bucket["best_weighted_value"] = weighted_value
                 bucket["best_item_id"] = int(row["item_id"])
                 bucket["best_item_chance"] = chance
-                bucket["best_item_price"] = float(avg_price)
+                bucket["best_item_price"] = float(market_price)
 
         with db:
             db.execute("DELETE FROM relic_ev")
