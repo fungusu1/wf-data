@@ -87,7 +87,7 @@ h4 {
   align-items: center;
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 999px;
+  border-radius: 1px;
   padding: 10px 14px;
 }
 
@@ -100,7 +100,7 @@ h4 {
 .panel {
   background: rgba(255, 253, 247, 0.78);
   border: 1px solid var(--line);
-  border-radius: 20px;
+  border-radius: 5px;
   padding: 18px;
   backdrop-filter: blur(6px);
 }
@@ -114,7 +114,7 @@ h4 {
   margin: 0 0 14px;
   padding: 12px 14px;
   border: 1px solid var(--line);
-  border-radius: 12px;
+  border-radius: 4px;
   background: #fffdf9;
   color: var(--text);
   font: inherit;
@@ -128,7 +128,7 @@ h4 {
 .card {
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 16px;
+  border-radius: 4px;
   overflow: hidden;
 }
 
@@ -151,7 +151,7 @@ h4 {
   height: 64px;
   object-fit: contain;
   background: radial-gradient(circle at 30% 30%, #fff8ef, #e8dcc8);
-  border-radius: 14px;
+  border-radius: 4px;
   border: 1px solid var(--line);
   padding: 8px;
   flex: 0 0 auto;
@@ -249,10 +249,53 @@ h4 {
   margin-bottom: 2px;
 }
 
+.view-switch {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.view-btn {
+  padding: 12px 18px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+  text-transform: uppercase;
+  cursor: pointer;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  transition: 
+    background 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease;
+}
+
+.view-btn:hover {
+  background: #faf5eb;
+  border-color: #cbbfa9;
+}
+
+.view-btn.is-active {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.is-hidden {
+  display: none !important;
+}
+
 .empty {
   padding: 18px;
   border: 1px dashed var(--line);
-  border-radius: 14px;
+  border-radius: 4px;
   color: var(--muted);
   text-align: center;
 }

@@ -11,7 +11,11 @@
       <header class="header">
         <div>
           <p class="eyebrow">wfstats</p>
-          <h1>Relics and missions worth running</h1>
+          <div class="view-switch">
+            <button class="view-btn is-active" data-view="relics">Relics</button>
+            <button class="view-btn" data-view="mods">Mods</button>
+            <button class="view-btn" data-view="missions">Missions</button>
+          </div>
         </div>
         <label class="toggle">
           <input id="vaulted-toggle" type="checkbox" />
@@ -20,7 +24,7 @@
       </header>
 
       <section class="grid">
-        <section class="panel">
+        <section class="panel" data-view="relics">
           <div class="panel-head">
             <h2>Relics</h2>
           </div>
@@ -28,12 +32,19 @@
           <div id="relic-list" class="card-list"></div>
         </section>
 
-        <section class="panel">
+        <section class="panel" data-view="missions">
           <div class="panel-head">
             <h2>Missions</h2>
           </div>
           <input id="mission-search" class="search" type="search" placeholder="Search missions or relics" />
           <div id="mission-list" class="card-list"></div>
+        </section>
+
+        <section class="panel is-hidden" data-view="mods">
+          <div class="panel-head">
+            <h2>Mods</h2>
+          </div>
+          <div id="mod-list" class="card-list"></div>
         </section>
       </section>
     </main>

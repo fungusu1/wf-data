@@ -11,7 +11,11 @@ const CDN_BASE = "https://cdn.warframestat.us/img/";
 const state = {
   relics: [],
   missions: [],
+  view: "relics",
 };
+
+const viewButtons = document.querySelectorAll(".view-btn");
+const panels = document.querySelectorAll(".panel");
 
 function plat(value) {
   return value == null ? "-" : `${Number(value).toFixed(2)}p`;
@@ -190,6 +194,31 @@ function render() {
   renderRelics();
   renderMissions();
 }
+
+function setView(view) {
+  state.view = view;
+
+  // update buttons
+  viewButtons.forEach(btn => {
+    btn.classList.toggle("is-active", btn.dataset.view === view);
+  });
+
+  // show/hide panels
+  panels.forEach(panel => {
+    panel.classList.toggle(
+      "is-hidden",
+      panel.dataset.view !== view
+    );
+  });
+}
+
+viewButtons.forEach(btn => {
+  btn.addEventListener("click", () => {
+    setView(btn.dataset.view);
+  });
+});
+
+setView("relics");
 
 async function loadDashboard() {
   const [relicResponse, missionResponse] = await Promise.all([
