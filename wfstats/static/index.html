@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>wfstats</title>
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="/static/app.css" />
   </head>
   <body>
@@ -14,6 +15,7 @@
           <div class="view-switch">
             <button class="view-btn is-active" data-view="relics">Relics</button>
             <button class="view-btn" data-view="mods">Mods</button>
+            <button class="view-btn" data-view="syndicate">Syndicate</button>
             <button class="view-btn" data-view="missions">Missions</button>
           </div>
         </div>
@@ -44,7 +46,25 @@
           <div class="panel-head">
             <h2>Mods</h2>
           </div>
+          <input id="mod-search" class="search" type="search" placeholder="Search mods" />
+          <details class="filter-menu">
+            <summary>Filter Sources</summary>
+            <label class="filter-option"><input id="mod-filter-enemy" type="checkbox" checked /> Enemy</label>
+            <label class="filter-option"><input id="mod-filter-mission" type="checkbox" checked /> Mission</label>
+            <label class="filter-option"><input id="mod-filter-other" type="checkbox" checked /> Other drop</label>
+          </details>
           <div id="mod-list" class="card-list"></div>
+        </section>
+
+        <section class="panel is-hidden" data-view="syndicate">
+          <div class="panel-head">
+            <h2>Syndicate Mods</h2>
+          </div>
+          <input id="syndicate-search" class="search" type="search" placeholder="Search syndicate mods" />
+          <select id="syndicate-vendor-filter" class="search">
+            <option value="">All syndicates</option>
+          </select>
+          <div id="syndicate-list" class="card-list"></div>
         </section>
       </section>
     </main>
@@ -88,6 +108,34 @@
             <p class="card-ev"></p>
             <p class="card-meta"></p>
           </div>
+        </div>
+      </article>
+    </template>
+
+    <template id="mod-card-template">
+      <article class="card">
+        <button class="card-button" type="button">
+          <div class="card-top">
+            <div class="card-main">
+              <div class="card-title-row">
+                <h3 class="card-title"></h3>
+                <span class="pill"></span>
+              </div>
+              <p class="card-ev"></p>
+              <p class="card-meta"></p>
+              <div class="tag-row"></div>
+            </div>
+          </div>
+        </button>
+        <div class="card-detail is-hidden">
+          <section>
+            <h4>Price</h4>
+            <div class="detail-table mod-prices"></div>
+          </section>
+          <section>
+            <h4>Sources</h4>
+            <div class="detail-table mod-sources"></div>
+          </section>
         </div>
       </article>
     </template>

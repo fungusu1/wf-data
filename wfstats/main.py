@@ -13,6 +13,7 @@ from wfstats.helpers import get_con
 from wfstats.ingestion.calculate import calculate_relic_ev
 from wfstats.ingestion.drops import sync_drop_sources
 from wfstats.ingestion.items import sync_relics
+from wfstats.ingestion.mods import sync_mods
 from wfstats.ingestion.market import sync_market_orders
 from wfstats.scheduler import (
     get_scheduler_status,
@@ -24,6 +25,14 @@ from wfstats.scheduler import (
 
 STATIC_DIR = Path(__file__).parent / "static"
 REFINEMENT_STATES = ("Intact", "Exceptional", "Flawless", "Radiant")
+SYNDICATE_VENDOR_NAMES = (
+    "Arbiters of Hexis",
+    "Cephalon Suda",
+    "New Loka",
+    "Perrin Sequence",
+    "Red Veil",
+    "Steel Meridian",
+)
 log = logging.getLogger(__name__)
 
 
@@ -31,6 +40,10 @@ log = logging.getLogger(__name__)
 async def lifespan(_: FastAPI):
     conn = create_db()
     conn.close()
+    try:
+        sync_mods()
+    except Exception:
+        log.exception("Initial mod sync failed")
     if should_force_startup_refresh():
         started = start_background_market_refresh(force=True)
         if started:
@@ -69,6 +82,34 @@ def _group_ev_by_state(rows) -> dict[str, float | None]:
     for row in rows:
         ev_by_state[row["state"]] = row["expected_value_plat"]
     return ev_by_state
+
+
+def _price_payload(row) -> dict[str, object]:
+    return {
+        "order_count": row["order_count"],
+        "min_sell_price": row["min_sell_price"],
+        "avg_sell_price": row["avg_sell_price"],
+        "current_median_sell_price": row["median_sell_price"],
+        "historical_median_90d": row["historical_median_90d"],
+        "historical_wa_price_90d": row["historical_wa_price_90d"],
+    }
+
+
+def _split_names(value: str | None) -> list[str]:
+    return sorted(filter(None, str(value or "").split(",")))
+
+
+def _normalize_name_lookup(value: str) -> str:
+    lowered = value.lower().replace("’", "'")
+    return "".join(ch for ch in lowered if ch.isalnum())
+
+
+def _syndicate_name_case_expression(column: str) -> str:
+    parts = []
+    for name in SYNDICATE_VENDOR_NAMES:
+        escaped = name.replace("'", "''")
+        parts.append(f"WHEN {column} = '{escaped}' OR {column} LIKE '{escaped},%' THEN '{escaped}'")
+    return "CASE " + " ".join(parts) + " ELSE NULL END"
 
 
 def _top_relic_cards(limit: int, include_vaulted: bool, sort_state: str) -> list[dict[str, object]]:
@@ -167,6 +208,103 @@ def _top_mission_cards(limit: int, include_vaulted: bool, state: str) -> list[di
         conn.close()
 
 
+def _mods_query(
+    limit: int | None = None,
+    search: str | None = None,
+) -> tuple[str, list[object]]:
+    syndicate_case = _syndicate_name_case_expression("ms.source_name")
+    query = """
+        SELECT
+            m.id,
+            m.mod_name,
+            m.mod_type,
+            m.compat_name,
+            m.polarity,
+            m.rarity,
+            m.base_drain,
+            m.fusion_limit,
+            m.is_augment,
+            m.is_syndicate_augment,
+            i.wfcd_id,
+            i.wfm_slug,
+            i.image_name,
+            i.is_tradable,
+            p.order_count,
+            p.min_sell_price,
+            p.avg_sell_price,
+            p.median_sell_price,
+            p.historical_median_90d,
+            p.historical_wa_price_90d,
+            COUNT(ms.id) AS source_count,
+            MAX(CASE WHEN ms.source_category = 'enemy' OR ms.enemy_mod_drop_chance IS NOT NULL THEN 1 ELSE 0 END) AS has_enemy_source,
+            MAX(CASE WHEN ms.source_name LIKE '%%, Rotation %%' THEN 1 ELSE 0 END) AS has_mission_source,
+            MAX(CASE
+                WHEN ms.id IS NOT NULL
+                 AND NOT (ms.source_category = 'enemy' OR ms.enemy_mod_drop_chance IS NOT NULL)
+                 AND ms.source_name NOT LIKE '%%, Rotation %%'
+                THEN 1
+                ELSE 0
+            END) AS has_other_source,
+            GROUP_CONCAT(
+                DISTINCT CASE
+                    WHEN ms.source_category = 'vendor' THEN ms.source_name
+                    ELSE NULL
+                END
+            ) AS vendor_names,
+            GROUP_CONCAT(
+                DISTINCT """ + syndicate_case + """
+            ) AS syndicate_names
+        FROM mods m
+        JOIN items i ON i.id = m.item_id
+        LEFT JOIN v_item_prices p ON p.item_id = i.id
+        LEFT JOIN mod_sources ms ON ms.mod_id = m.id
+        WHERE 1 = 1
+    """
+    params: list[object] = []
+    if search:
+        query += " AND LOWER(m.mod_name) LIKE ?"
+        params.append(f"%{search.lower()}%")
+    query += """
+        GROUP BY
+            m.id,
+            m.mod_name,
+            m.mod_type,
+            m.compat_name,
+            m.polarity,
+            m.rarity,
+            m.base_drain,
+            m.fusion_limit,
+            m.is_augment,
+            m.is_syndicate_augment,
+            i.wfcd_id,
+            i.wfm_slug,
+            i.image_name,
+            i.is_tradable,
+            p.order_count,
+            p.min_sell_price,
+            p.avg_sell_price,
+            p.median_sell_price,
+            p.historical_median_90d,
+            p.historical_wa_price_90d
+        ORDER BY
+            COALESCE(p.historical_median_90d, p.median_sell_price, p.avg_sell_price, 0) DESC,
+            m.mod_name
+    """
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(limit)
+    return query, params
+
+
+@app.post("/sync/mods")
+@app.post("/api/sync/mods")
+def sync_mod_data(force: bool = False):
+    try:
+        return sync_mods(force=force)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Mod sync failed: {exc}") from exc
+
+
 @app.get("/")
 def frontend():
     return FileResponse(STATIC_DIR / "index.html")
@@ -189,7 +327,7 @@ def sync_items(force: bool = False):
 
 
 @app.post("/sync/market")
-def sync_market(limit: int = 5):
+def sync_market(limit: int = 0):
     try:
         result = sync_market_orders(limit=limit)
         result["relic_ev"] = calculate_relic_ev()
@@ -408,5 +546,232 @@ def get_relic(tier: str, relic_name: str):
             "missions": [dict(row) for row in mission_rows],
             "transient_sources": [dict(row) for row in transient_rows],
         }
+    finally:
+        conn.close()
+
+
+@app.get("/mods")
+@app.get("/api/mods")
+def list_mods(
+    search: str | None = None,
+    limit: int = 50,
+):
+    requested_limit = _normalize_optional_limit(limit)
+    conn = get_con()
+    try:
+        query, params = _mods_query(limit=None, search=search)
+        rows = conn.execute(query, params).fetchall()
+        payload = []
+        for row in rows:
+            syndicate_names = _split_names(row["syndicate_names"])
+            if syndicate_names:
+                continue
+            payload.append(
+                {
+                "id": row["id"],
+                "name": row["mod_name"],
+                "mod_name": row["mod_name"],
+                "mod_type": row["mod_type"],
+                "compat_name": row["compat_name"],
+                "polarity": row["polarity"],
+                "rarity": row["rarity"],
+                "base_drain": row["base_drain"],
+                "fusion_limit": row["fusion_limit"],
+                "is_augment": row["is_augment"],
+                "is_syndicate_augment": row["is_syndicate_augment"],
+                "wfcd_id": row["wfcd_id"],
+                "wfm_slug": row["wfm_slug"],
+                "image_name": row["image_name"],
+                "is_tradable": row["is_tradable"],
+                "price": _price_payload(row),
+                "source_count": row["source_count"],
+                "vendor_names": _split_names(row["vendor_names"]),
+                "source_flags": {
+                    "enemy": bool(row["has_enemy_source"]),
+                    "mission": bool(row["has_mission_source"]),
+                    "other": bool(row["has_other_source"]),
+                },
+            }
+            )
+        if requested_limit is not None:
+            return payload[:requested_limit]
+        return payload
+    finally:
+        conn.close()
+
+
+@app.get("/syndicate-mods")
+@app.get("/api/syndicate-mods")
+def list_syndicate_mods(
+    search: str | None = None,
+    vendor: str | None = None,
+    limit: int = 50,
+):
+    requested_limit = _normalize_optional_limit(limit)
+    conn = get_con()
+    try:
+        query, params = _mods_query(limit=None, search=search)
+        rows = conn.execute(query, params).fetchall()
+        payload = []
+        for row in rows:
+            vendor_names = _split_names(row["syndicate_names"])
+            if not vendor_names:
+                continue
+            if vendor and vendor not in vendor_names:
+                continue
+            payload.append(
+                {
+                    "id": row["id"],
+                    "name": row["mod_name"],
+                    "mod_name": row["mod_name"],
+                    "mod_type": row["mod_type"],
+                    "compat_name": row["compat_name"],
+                    "polarity": row["polarity"],
+                    "rarity": row["rarity"],
+                    "base_drain": row["base_drain"],
+                    "fusion_limit": row["fusion_limit"],
+                    "is_augment": row["is_augment"],
+                    "is_syndicate_augment": row["is_syndicate_augment"],
+                    "wfcd_id": row["wfcd_id"],
+                    "wfm_slug": row["wfm_slug"],
+                    "image_name": row["image_name"],
+                    "is_tradable": row["is_tradable"],
+                    "price": _price_payload(row),
+                    "source_count": row["source_count"],
+                    "vendor_names": vendor_names,
+                    "source_flags": {
+                        "enemy": bool(row["has_enemy_source"]),
+                        "mission": bool(row["has_mission_source"]),
+                        "other": bool(row["has_other_source"]),
+                    },
+                }
+            )
+        if requested_limit is not None:
+            return payload[:requested_limit]
+        return payload
+    finally:
+        conn.close()
+
+
+@app.get("/syndicate-vendors")
+@app.get("/api/syndicate-vendors")
+def list_syndicate_vendors():
+    return list(SYNDICATE_VENDOR_NAMES)
+
+
+@app.get("/mods/{mod_name:path}")
+@app.get("/api/mods/{mod_name:path}")
+def get_mod(mod_name: str):
+    conn = get_con()
+    try:
+        mod = conn.execute(
+            """
+            SELECT
+                m.id,
+                m.mod_name,
+                m.mod_type,
+                m.compat_name,
+                m.polarity,
+                m.rarity,
+                m.base_drain,
+                m.fusion_limit,
+                m.is_augment,
+                m.is_syndicate_augment,
+                i.wfcd_id,
+                i.wfm_slug,
+                i.image_name,
+                i.is_tradable,
+                p.order_count,
+                p.min_sell_price,
+                p.avg_sell_price,
+                p.median_sell_price,
+                p.historical_median_90d,
+                p.historical_wa_price_90d
+            FROM mods m
+            JOIN items i ON i.id = m.item_id
+            LEFT JOIN v_item_prices p ON p.item_id = i.id
+            WHERE LOWER(m.mod_name) = LOWER(?)
+               OR LOWER(REPLACE(REPLACE(m.mod_name, '''', ''), '’', '')) = LOWER(REPLACE(REPLACE(?, '''', ''), '’', ''))
+            """,
+            [mod_name, mod_name],
+        ).fetchone()
+
+        if mod is None:
+            normalized_lookup = _normalize_name_lookup(mod_name)
+            rows = conn.execute(
+                """
+                SELECT
+                    m.id,
+                    m.mod_name,
+                    m.mod_type,
+                    m.compat_name,
+                    m.polarity,
+                    m.rarity,
+                    m.base_drain,
+                    m.fusion_limit,
+                    m.is_augment,
+                    m.is_syndicate_augment,
+                    i.wfcd_id,
+                    i.wfm_slug,
+                    i.image_name,
+                    i.is_tradable,
+                    p.order_count,
+                    p.min_sell_price,
+                    p.avg_sell_price,
+                    p.median_sell_price,
+                    p.historical_median_90d,
+                    p.historical_wa_price_90d
+                FROM mods m
+                JOIN items i ON i.id = m.item_id
+                LEFT JOIN v_item_prices p ON p.item_id = i.id
+                """
+            ).fetchall()
+            mod = next((row for row in rows if _normalize_name_lookup(row["mod_name"]) == normalized_lookup), None)
+        if mod is None:
+            raise HTTPException(status_code=404, detail="Mod not found")
+
+        sources = conn.execute(
+            """
+            SELECT
+                source_category,
+                source_name,
+                source_detail,
+                chance,
+                rarity,
+                enemy_mod_drop_chance,
+                standing
+            FROM mod_sources
+            WHERE mod_id = ?
+            ORDER BY
+                CASE
+                    WHEN source_category = 'enemy' OR enemy_mod_drop_chance IS NOT NULL THEN 1
+                    WHEN source_name LIKE '%, Rotation %' THEN 2
+                    ELSE 3
+                END,
+                COALESCE(chance, enemy_mod_drop_chance, -1) DESC,
+                source_name,
+                source_detail
+            """,
+            [mod["id"]],
+        ).fetchall()
+
+        payload = dict(mod)
+        vendor_names = sorted(
+            {
+                str(row["source_name"])
+                for row in sources
+                if row["source_category"] == "vendor" and row["source_name"]
+            }
+        )
+        payload.update(
+            {
+                "name": mod["mod_name"],
+                "price": _price_payload(mod),
+                "sources": [dict(row) for row in sources],
+                "source_count": len(sources),
+                "vendor_names": vendor_names,
+            }
+        )
+        return payload
     finally:
         conn.close()

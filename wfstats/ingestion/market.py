@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 import time
 from typing import Any
@@ -16,6 +17,19 @@ SOURCE_NAME = "wfm_orders"
 log = logging.getLogger(__name__)
 
 
+def _slug_variants(slug: str) -> list[str]:
+    variants = [slug]
+    normalized = slug.lower().replace("’", "'")
+    cleaned = normalized.replace("'", "")
+    cleaned = re.sub(r"_+", "_", cleaned)
+    alt_dash = cleaned.replace("_", "-")
+    alt_underscore = cleaned.replace("-", "_")
+    for candidate in (cleaned, alt_dash, alt_underscore):
+        if candidate and candidate not in variants:
+            variants.append(candidate)
+    return variants
+
+
 def _open_db() -> sqlite3.Connection:
     conn = create_db(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -24,17 +38,27 @@ def _open_db() -> sqlite3.Connection:
 
 
 def _fetch_orders(slug: str) -> list[dict[str, Any]]:
-    response = requests.get(ORDERS_URL.format(slug=slug), timeout=30)
-    response.raise_for_status()
-    payload = response.json()
-    return payload.get("data", [])
+    for candidate in _slug_variants(slug):
+        response = requests.get(ORDERS_URL.format(slug=candidate), timeout=30)
+        if response.status_code == 404:
+            continue
+        response.raise_for_status()
+        payload = response.json()
+        return payload.get("data", [])
+    log.warning("No warframe.market v2 orders found for slug %s", slug)
+    return []
 
 
 def _fetch_statistics(slug: str) -> dict[str, Any]:
-    response = requests.get(STATISTICS_URL.format(slug=slug), timeout=30)
-    response.raise_for_status()
-    payload = response.json()
-    return payload.get("payload", {}).get("statistics_closed", {})
+    for candidate in _slug_variants(slug):
+        response = requests.get(STATISTICS_URL.format(slug=candidate), timeout=30)
+        if response.status_code == 404:
+            continue
+        response.raise_for_status()
+        payload = response.json()
+        return payload.get("payload", {}).get("statistics_closed", {})
+    log.warning("No warframe.market v1 statistics found for slug %s", slug)
+    return {}
 
 
 def _percentile(values: list[int], p: float) -> float:
@@ -118,15 +142,23 @@ def _candidate_items(conn: sqlite3.Connection, limit: int | None) -> list[sqlite
             i.id,
             i.item_name,
             i.wfm_slug,
-            MAX(CASE WHEN r.is_vaulted = 0 THEN 1 ELSE 0 END) AS has_unvaulted_source,
+            MAX(
+                CASE
+                    WHEN r.is_vaulted = 0 THEN 2
+                    WHEN m.id IS NOT NULL THEN 1
+                    ELSE 0
+                END
+            ) AS source_priority,
             MAX(mo.fetched_at) AS last_fetched_at
         FROM items i
-        JOIN relic_rewards rr ON rr.item_id = i.id
-        JOIN relics r ON r.id = rr.relic_id
+        LEFT JOIN relic_rewards rr ON rr.item_id = i.id
+        LEFT JOIN relics r ON r.id = rr.relic_id
+        LEFT JOIN mods m ON m.item_id = i.id
         LEFT JOIN market_orders mo ON mo.item_id = i.id
         WHERE i.is_tradable = 1 AND i.wfm_slug IS NOT NULL
+          AND (rr.id IS NOT NULL OR m.id IS NOT NULL)
         GROUP BY i.id, i.item_name, i.wfm_slug
-        ORDER BY has_unvaulted_source DESC, last_fetched_at IS NOT NULL, last_fetched_at, i.item_name
+        ORDER BY source_priority DESC, last_fetched_at IS NOT NULL, last_fetched_at, i.item_name
     """
     params: list[object] = []
     if limit is not None:

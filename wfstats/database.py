@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS sync_log (
 );
 
 -- ─────────────────────────────────────────────
--- Items  (source: warframe-items Relics.json → rewards[].item)
+-- Items  (shared marketable entities: relic rewards, mods, etc.)
 -- ─────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS items (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,6 +58,41 @@ CREATE TABLE IF NOT EXISTS relic_rewards (
     item_id         INTEGER NOT NULL REFERENCES items(id)  ON DELETE CASCADE,
     rarity          TEXT    NOT NULL,   -- "Common" | "Uncommon" | "Rare"
     UNIQUE (relic_id, item_id)
+);
+
+-- ─────────────────────────────────────────────
+-- Mods  (source: warframe-items Mods.json)
+-- One row per mod, with tradeability and augment metadata stored on the item.
+-- ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS mods (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id             INTEGER NOT NULL UNIQUE REFERENCES items(id) ON DELETE CASCADE,
+    mod_name            TEXT    NOT NULL,
+    mod_type            TEXT,
+    compat_name         TEXT,
+    polarity            TEXT,
+    rarity              TEXT,
+    base_drain          INTEGER,
+    fusion_limit        INTEGER,
+    is_augment          INTEGER NOT NULL DEFAULT 0,
+    is_syndicate_augment INTEGER NOT NULL DEFAULT 0
+);
+
+-- ─────────────────────────────────────────────
+-- Mod sources
+-- Includes enemy drops, vendor offerings, and other WFCD-listed acquisition paths.
+-- ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS mod_sources (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    mod_id                  INTEGER NOT NULL REFERENCES mods(id) ON DELETE CASCADE,
+    source_category         TEXT    NOT NULL, -- 'enemy' | 'vendor' | 'drop'
+    source_name             TEXT    NOT NULL,
+    source_detail           TEXT,
+    chance                  REAL,
+    rarity                  TEXT,
+    enemy_mod_drop_chance   REAL,
+    standing                INTEGER,
+    UNIQUE (mod_id, source_category, source_name, source_detail)
 );
 
 -- ─────────────────────────────────────────────
@@ -157,6 +192,11 @@ CREATE INDEX IF NOT EXISTS idx_relics_tier_name          ON relics(tier, relic_n
 CREATE INDEX IF NOT EXISTS idx_relic_rewards_relic       ON relic_rewards(relic_id);
 CREATE INDEX IF NOT EXISTS idx_relic_rewards_item        ON relic_rewards(item_id);
 CREATE INDEX IF NOT EXISTS idx_relic_reward_chances      ON relic_reward_chances(relic_reward_id, state);
+CREATE INDEX IF NOT EXISTS idx_mods_item                 ON mods(item_id);
+CREATE INDEX IF NOT EXISTS idx_mods_name                 ON mods(mod_name);
+CREATE INDEX IF NOT EXISTS idx_mods_syndicate_augment    ON mods(is_syndicate_augment);
+CREATE INDEX IF NOT EXISTS idx_mod_sources_mod           ON mod_sources(mod_id);
+CREATE INDEX IF NOT EXISTS idx_mod_sources_category      ON mod_sources(source_category, source_name);
 CREATE INDEX IF NOT EXISTS idx_mission_sources_relic     ON relic_mission_sources(relic_id);
 CREATE INDEX IF NOT EXISTS idx_transient_sources_relic   ON relic_transient_sources(relic_id);
 CREATE INDEX IF NOT EXISTS idx_market_orders_item        ON market_orders(item_id, fetched_at);
